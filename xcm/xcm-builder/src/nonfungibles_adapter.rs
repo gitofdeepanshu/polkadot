@@ -325,3 +325,175 @@ impl<
 		)
 	}
 }
+
+pub struct PSP34MutateAdapter<
+	Assets,
+	Matcher,
+	AccountIdConverter,
+	AccountId,
+	CheckAsset,
+	CheckingAccount,
+>(PhantomData<(Assets, Matcher, AccountIdConverter, AccountId, CheckAsset, CheckingAccount)>);
+
+impl<
+		Assets: nonfungibles::MutatePSP34<AccountId>,
+		Matcher: MatchesNonFungibles<Assets::CollectionId, Assets::ItemId>,
+		AccountIdConverter: Convert<MultiLocation, AccountId>,
+		AccountId: Clone + Eq + From<[u8;32]>, // can't get away without it since Currency is generic over it.
+		CheckAsset: AssetChecking<Assets::CollectionId>,
+		CheckingAccount: Get<Option<AccountId>>,
+	>
+	PSP34MutateAdapter<
+		Assets,
+		Matcher,
+		AccountIdConverter,
+		AccountId,
+		CheckAsset,
+		CheckingAccount,
+	>
+{
+	fn can_accrue_checked( class: Assets::CollectionId, instance: Assets::ItemId) -> XcmResult {
+		if let Some(checking_account) = CheckingAccount::get() {
+			ensure!(Assets::owner(&checking_account,&class, &instance).is_none(), XcmError::NotDepositable);
+			Ok(())
+		}
+	}
+	fn can_reduce_checked(class: Assets::CollectionId, instance: Assets::ItemId) -> XcmResult {
+		if let Some(checking_account) = CheckingAccount::get() {
+			// This is an asset whose teleports we track.
+			let owner = Assets::owner(&checking_account,&class, &instance);
+			ensure!(owner == Some(checking_account), XcmError::NotWithdrawable);
+			ensure!(Assets::can_transfer(&class, &instance), XcmError::NotWithdrawable);
+		}
+		Ok(())
+	}
+	fn accrue_checked(class: Assets::CollectionId, instance: Assets::ItemId) {
+		if let Some(checking_account) = CheckingAccount::get() {
+			let ok = Assets::mint_into(&class, &instance, &checking_account).is_ok();
+			debug_assert!(ok, "`mint_into` cannot generally fail; qed");
+		}
+	}
+	fn reduce_checked(class: Assets::CollectionId, instance: Assets::ItemId) {
+		let ok = Assets::burn(&class, &instance, None).is_ok();
+		debug_assert!(ok, "`can_check_in` must have returned `true` immediately prior; qed");
+	}
+}
+
+impl<
+		Assets: nonfungibles::MutatePSP34<AccountId>,
+		Matcher: MatchesNonFungibles<Assets::CollectionId, Assets::ItemId>,
+		AccountIdConverter: Convert<MultiLocation, AccountId>,
+		AccountId: Clone + Eq, // can't get away without it since Currency is generic over it.
+		CheckAsset: AssetChecking<Assets::CollectionId>,
+		CheckingAccount: Get<Option<AccountId>>,
+	> TransactAsset
+	for PSP34MutateAdapter<
+		Assets,
+		Matcher,
+		AccountIdConverter,
+		AccountId,
+		CheckAsset,
+		CheckingAccount,
+	>
+{
+	fn can_check_in(_origin: &MultiLocation, what: &MultiAsset, context: &XcmContext) -> XcmResult {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"can_check_in origin: {:?}, what: {:?}, context: {:?}",
+			_origin, what, context,
+		);
+		// Check we handle this asset.
+		let (class, instance) = Matcher::matches_nonfungibles(what)?;
+		match CheckAsset::asset_checking(&class) {
+			// We track this asset's teleports to ensure no more come in than have gone out.
+			Some(MintLocation::Local) => Self::can_reduce_checked(class, instance),
+			// We track this asset's teleports to ensure no more go out than have come in.
+			Some(MintLocation::NonLocal) => Self::can_accrue_checked(class, instance),
+			_ => Ok(()),
+		}
+	}
+
+	fn check_in(_origin: &MultiLocation, what: &MultiAsset, context: &XcmContext) {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"check_in origin: {:?}, what: {:?}, context: {:?}",
+			_origin, what, context,
+		);
+		if let Ok((class, instance)) = Matcher::matches_nonfungibles(what) {
+			match CheckAsset::asset_checking(&class) {
+				// We track this asset's teleports to ensure no more come in than have gone out.
+				Some(MintLocation::Local) => Self::reduce_checked(class, instance),
+				// We track this asset's teleports to ensure no more go out than have come in.
+				Some(MintLocation::NonLocal) => Self::accrue_checked(class, instance),
+				_ => (),
+			}
+		}
+	}
+
+	fn can_check_out(_dest: &MultiLocation, what: &MultiAsset, context: &XcmContext) -> XcmResult {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"can_check_out dest: {:?}, what: {:?}, context: {:?}",
+			_dest, what, context,
+		);
+		// Check we handle this asset.
+		let (class, instance) = Matcher::matches_nonfungibles(what)?;
+		match CheckAsset::asset_checking(&class) {
+			// We track this asset's teleports to ensure no more come in than have gone out.
+			Some(MintLocation::Local) => Self::can_accrue_checked(class, instance),
+			// We track this asset's teleports to ensure no more go out than have come in.
+			Some(MintLocation::NonLocal) => Self::can_reduce_checked(class, instance),
+			_ => Ok(()),
+		}
+	}
+
+	fn check_out(_dest: &MultiLocation, what: &MultiAsset, context: &XcmContext) {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"check_out dest: {:?}, what: {:?}, context: {:?}",
+			_dest, what, context,
+		);
+		if let Ok((class, instance)) = Matcher::matches_nonfungibles(what) {
+			match CheckAsset::asset_checking(&class) {
+				// We track this asset's teleports to ensure no more come in than have gone out.
+				Some(MintLocation::Local) => Self::accrue_checked(class, instance),
+				// We track this asset's teleports to ensure no more go out than have come in.
+				Some(MintLocation::NonLocal) => Self::reduce_checked(class, instance),
+				_ => (),
+			}
+		}
+	}
+
+	fn deposit_asset(what: &MultiAsset, who: &MultiLocation, context: &XcmContext) -> XcmResult {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"deposit_asset what: {:?}, who: {:?}, context: {:?}",
+			what, who, context,
+		);
+		// Check we handle this asset.
+		let (class, instance) = Matcher::matches_nonfungibles(what)?;
+		let who = AccountIdConverter::convert_ref(who)
+			.map_err(|()| MatchError::AccountIdConversionFailed)?;
+		Assets::mint_into(&class, &instance.into(), &who)
+			.map_err(|e| XcmError::FailedToTransactAsset(e.into()))
+	}
+
+	fn withdraw_asset(
+		what: &MultiAsset,
+		who: &MultiLocation,
+		maybe_context: Option<&XcmContext>,
+	) -> result::Result<xcm_executor::Assets, XcmError> {
+		log::trace!(
+			target: "xcm::fungibles_adapter",
+			"withdraw_asset what: {:?}, who: {:?}, maybe_context: {:?}",
+			what, who, maybe_context,
+		);
+		// Check we handle this asset.
+		let who = AccountIdConverter::convert_ref(who)
+			.map_err(|()| MatchError::AccountIdConversionFailed)?;
+		let (class, instance) = Matcher::matches_nonfungibles(what)?;
+		Assets::burn(&class, &instance.into(), &who)
+			.map_err(|e| XcmError::FailedToTransactAsset(e.into()))?;
+		Ok(what.clone().into())
+	}
+}
